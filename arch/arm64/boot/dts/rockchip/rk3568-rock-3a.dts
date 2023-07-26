@@ -554,6 +554,24 @@
 		};
 	};
 
+    can0 {
+            can0m0_pins: can0m0-pins {
+                    rockchip,pins =
+                            /* can0_rxm0 */
+                            <0 RK_PB4 2 &pcfg_pull_none>,
+                            /* can0_txm0 */
+                            <0 RK_PB3 2 &pcfg_pull_none>;
+            };
+
+            can0m1_pins: can0m1-pins {
+                    rockchip,pins =
+                            /* can0_rxm1 */
+                            <2 RK_PA2 4 &pcfg_pull_none>,
+                            /* can0_txm1 */
+                            <2 RK_PA1 4 &pcfg_pull_none>;
+            };
+    };
+
 	display {
 		vcc_mipi_en: vcc_mipi_en {
 			rockchip,pins = <3 RK_PC0 RK_FUNC_GPIO &pcfg_pull_none>;
