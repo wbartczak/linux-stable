@@ -1,0 +1,14 @@
+menuconfig CAN_ROCKCHIP
+	tristate "Rockchip CAN controller"
+	depends on ARCH_ROCKCHIP
+	help
+	  Say Y here if you want to support CAN controller on Rockchip SoC's.
+
+if CAN_ROCKCHIP
+
+config CAN_RK3568
+	tristate "RK3568 CAN controller"
+	help
+	  Say Y for support of CAN for RK3568.
+
+endif # CAN_ROCKCHIP
