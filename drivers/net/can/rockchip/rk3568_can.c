@@ -874,6 +874,7 @@ static int rockchip_can_remove(struct platform_device *pdev)
 #define CAN_INT_MASK_NONE	0x0000
 
 #define CAN_RX_FILTER_MASK	0x1fffffff
+#define CAN_TX_ID_MASK		0x1fffffff
 
 struct rk3568_data {
 	struct can_priv can;
@@ -922,14 +923,14 @@ static int rk3568_can_set_btt(struct net_device *ndev)
 
 	dev_info(rd->dev, "setting bittiming: 0x%04x, brp: %u, bitrate: %u\n",
 		 val, btt->brp, btt->bitrate);
-	
+
 	return 0;
 }
 
 static int rk3568_can_start(struct net_device *ndev)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
-	
+
 	/* Reset controller, ensure proper initial state */
 	rk3568_can_reset(rd);
 	/* Enable all interrupts */
@@ -952,7 +953,7 @@ static int rk3568_can_open(struct net_device *ndev)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
 	int ret;
-	
+
 	ret = open_candev(ndev);
 	if (ret) {
 		dev_err(rd->dev, "Can't open CAN device!\n");
@@ -978,7 +979,7 @@ static int rk3568_can_stop(struct net_device *ndev)
 	rd->can.state = CAN_STATE_STOPPED;
 	rk3568_can_reset(rd);
 	// This is crap, interrupts shoud be received and cleared.
-	writew(CAN_INT_MASK_ALL, rd->base + CAN_INT_MASK); 
+	writew(CAN_INT_MASK_ALL, rd->base + CAN_INT_MASK);
 	close_candev(ndev);
 	dev_info(rd->dev, "CAN stopped!\n");
 
@@ -989,15 +990,51 @@ static int rk3568_can_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
 	struct can_frame *cf = (struct can_frame *)skb->data;
+	u8 tx_frm_info = 0;
+	u32 data1 = 0;
+	u32 data2 = 0;
 
 	if (can_dropped_invalid_skb(ndev, skb);
 		return NETDEV_TX_OK;
-	
-	
 
-	return 0;
+	netif_stop_queue(ndev);
+
+	/* Check frame properties */
+	if (cf->can_id & CAN_EFF_FLAG)
+		tx_frm_info |= 0x80;
+
+	/* Determines also message length */
+	if (!(cf->can_id & CAN_RTR_FLAG)) {
+		tx_frm_info = cf->len; /* message length */
+		/* Non RTR messages have data */
+		data1 = __le32_to_cpup((__le32 *)&cf->data[0]);
+		data2 = __le32_to_cpup((__le32 *)&cf->data[4]);
+	} else {
+		tx_frm_info |= 0x40;
+	}
+
+	/* Clear requests */
+	writel(0, rd->base + CAN_CMD);
+	/* Write ID */
+	writel(cf->can_id & CAN_TX_ID_MASK, rd->base + CAN_TXID);
+	/* Write data if available */
+	if (!(cf->can_id & CAN_RTR_FLAG)) {
+		writel(data1, rd->base + CAN_TXDATA0);
+		writel(data2, rd->base + CAN_TXDATA1);
+	}
+	/* Write additional packet information */
+	writeb(tx_frm_info, rd->base + CAN_TXFRAMEINFO);
+	/* Start packet processing */
+	can_put_echo_skb(skb, ndev, 0, 0);
+
+	/* Request transfer */
+	writel(1, rd->base + CAN_CMD);
+
+	dev_info_ratelimited(rd->dev, "tx: can_id:0x%08x, dlc:%u, d0:0x%08x, d1:0x%08x\n",
+	                     cf->can_id, cf->len, data1, data2);
+
+	return NETDEV_TX_OK;
 }
-
 
 static const struct net_device_ops rk3568_can_netdev_ops = {
 	.ndo_open = rk3568_can_open,
@@ -1005,8 +1042,55 @@ static const struct net_device_ops rk3568_can_netdev_ops = {
 	.ndo_start_xmit = rk3568_can_start_xmit,
 };
 
+static void rk3568_can_rx(struct net_device *ndev)
+{
+	struct rk3568_data *rd = netdev_priv(ndev);
+	struct net_device_stats *stats = &ndev->stats;
+
+	struct can_frame *cf;
+	struct sk_buff *skb;
+
+	u8 rx_frm_info;
+	u8 len;
+
+	skb = alloc_can_skb(ndev, &cf);
+	if (!skb)
+		return;
+
+	rx_frm_info = readb(rd->base + CAN_RXFRAMEINFO);
+	len = rx_frm_info & 0xf;
+}
+
 static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
 {
+	struct net_device *ndev = (struct net_device *)dev_id;
+	struct rk3568_data *rd = netdev_priv(ndev);
+	struct net_device_stats *stats = &ndev->stats;
+
+	u8 intr = readb(rd->base + CAN_INT);
+
+	/* TX Finish */
+	if (intr & (1u << 1)) {
+		u8 bytes = readb(rd->base + CAN_TXFRAMEINFO);
+
+		/* Update statistics */
+		atomic_add((bytes & 0xf), &stats->tx_bytes);
+		atomic_inc(&stats->tx_packets);
+
+		/* Clear request */
+		writel(0, rd->base + CAN_CMD);
+		/* Make skb available */
+		can_get_echo_skb(ndev, 0, NULL);
+		/* Resume sending data */
+		netif_wake_queue(ndev);
+	}
+
+	if (intr & (1u << 0)) {
+
+	}
+
+	writeb(intr, rd->base + CAN_INT);
+
 	return IRQ_HANDLED;
 }
 
@@ -1021,7 +1105,7 @@ static const struct can_bittiming_const rk3568_can_btt_const = {
         .brp_min = 1,
         .brp_max = 128,
         .brp_inc = 2,
-}; 
+};
 
 static int rk3568_can_set_mode(struct net_device *ndev, enum can_mode mode)
 {
@@ -1035,7 +1119,7 @@ static int rk3568_can_set_mode(struct net_device *ndev, enum can_mode mode)
 		if (netif_queue_stopped(ndev)
 			netif_wake_queue(ndev);
 		break;
-	
+
 	case CAN_MODE_STOP:
 		return -EOPNOTSUPP;
 
@@ -1098,11 +1182,11 @@ static int rk3568_can_probe(struct platform_device *pdev)
 
 	rd->can.bittiming_const = &rk3568_can_btt_const;
         rd->can.do_set_mode = rk3568_can_set_mode;
-	rd->can.do_get_berr_counter = rk3568_can_get_berr_counter;	
+	rd->can.do_get_berr_counter = rk3568_can_get_berr_counter;
 	rd->can.ctrlmode_supported = CAN_CTRLMODE_BERR_REPORTING |
 		                     CAN_CTRLMODE_3_SAMPLES;
 
-	ret = devm_request_irq(&pdev->dev, irq, rk3568_can_intr, 0, "rk3568_can0", &pdev);
+	ret = devm_request_irq(&pdev->dev, irq, rk3568_can_intr, 0, "rk3568_can0", ndev);
 	if (ret) {
 		dev_err(&pdev->dev, "IRQ can't be registered");
 		goto failure;
@@ -1115,7 +1199,7 @@ static int rk3568_can_probe(struct platform_device *pdev)
 		/* Ensure that reset controller is up and running */
 		if (ret != -EPROBE_DEFER)
 			dev_err(&pdev->dev, "Failed to get get reset lines!");
-		
+
 		goto failure;
 	}
 
@@ -1127,7 +1211,7 @@ static int rk3568_can_probe(struct platform_device *pdev)
 			ret = rd->num_clks;
 		else
 			ret = -EINVAL;
-		
+
 		goto failure;
 	}
 
