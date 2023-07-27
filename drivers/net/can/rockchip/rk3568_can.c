@@ -127,18 +127,26 @@ static void rk3568_can_reset(struct rk3568_data *rd)
 {
 	/* This sequence resets whole CAN controller */
 	reset_control_assert(rd->reset);
-	udelay(5);
+	udelay(2);
 	reset_control_deassert(rd->reset);
 
-	writew(0, rd->base + CAN_MODE);
+	int ret = reset_control_status(rd->reset);
+	if (ret >= 0)
+		dev_info(rd->dev, "Reset status %s\n",
+			 ret == 0 ? "deasserted" : "asserted");
+
+	writel(0, rd->base + CAN_MODE);
 }
 
 static void rk3568_can_work(struct rk3568_data *rd)
 {
-	u16 mode = readw(rd->base + CAN_MODE);
+	u32 mode = readl(rd->base + CAN_MODE);
 	mode |= BIT(0) | BIT(10);
 
-	writew(mode, rd->base + CAN_MODE);
+	writel(mode, rd->base + CAN_MODE);
+
+	u32 confirm = readl(rd->base + CAN_MODE);
+	dev_info(rd->dev, "CAN mode work:0x%08x\n", confirm);
 }
 
 static int rk3568_can_set_btt(struct net_device *ndev)
@@ -146,17 +154,18 @@ static int rk3568_can_set_btt(struct net_device *ndev)
 	struct rk3568_data *rd = netdev_priv(ndev);
 	struct can_bittiming *btt = &rd->can.bittiming;
 
-	u16 val = ((btt->sjw - 1) << 14) | (((btt->brp >> 1) - 1) << 8) |
+	u32 val = ((btt->sjw - 1) << 14) | (((btt->brp >> 1) - 1) << 8) |
 		  /* rk3568 phase_seg1 is actuallty prop_seg + phase_seg1 */
 		  ((btt->prop_seg + btt->phase_seg1 - 1)) |
 		  ((btt->phase_seg2 - 1) << 4);
 	if (rd->can.ctrlmode & CAN_CTRLMODE_3_SAMPLES)
 		val |= 1 << 16;
 
-	writew(val, rd->base + CAN_BITTIMING);
-
-	dev_info(rd->dev, "setting bittiming: 0x%04x, brp: %u, bitrate: %u\n",
-		 val, btt->brp, btt->bitrate);
+	writel(val, rd->base + CAN_BITTIMING);
+	
+	u32 confirm = readl(rd->base + CAN_BITTIMING); 
+	dev_info(rd->dev, "setting bittiming: 0x%08x, brp: %u, bitrate: %u, confirm:0x%08xn",
+		 val, btt->brp, btt->bitrate, confirm);
 
 	return 0;
 }
@@ -565,7 +574,7 @@ static int rk3568_can_probe(struct platform_device *pdev)
 	rd->dev = &pdev->dev;
 	rd->base = addr;
 
-	ret = devm_request_irq(&pdev->dev, irq, rk3568_can_intr, "rk3568_can0", ndev);
+	ret = devm_request_irq(&pdev->dev, irq, rk3568_can_intr, 0, "rk3568_can0", ndev);
 	if (ret) {
 		dev_err(&pdev->dev, "IRQ can't be registered\n");
 		goto failure;
@@ -592,6 +601,16 @@ static int rk3568_can_probe(struct platform_device *pdev)
 			ret = -EINVAL;
 
 		goto failure;
+	}
+
+	dev_info(&pdev->dev, "Got %d clocks\n", rd->num_clks);
+
+	for (int i = 0; i < rd->num_clks; i++) {
+		ret = clk_prepare_enable(rd->clks[i].clk);
+		if (ret) {
+			dev_err(&pdev->dev, "Can't enable clock %d\n", i);
+			goto failure;
+		}
 	}
 
 	/* Register all operations */
