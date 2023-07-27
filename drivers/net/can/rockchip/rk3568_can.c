@@ -13,6 +13,7 @@
 #include <linux/can.h>
 #include <linux/can/dev.h>
 #include <linux/can/error.h>
+#include <linux/can/length.h>
 #include <linux/clk.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -336,7 +337,7 @@ static void rockchip_can_rx(struct net_device *ndev)
 		return;
 
 	fi = readl(rcan->base + CAN_RX_FRM_INFO);
-	cf->can_dlc = get_can_dlc(fi & CAN_DLC_MASK);
+	cf->can_dlc = can_frame_set_cc_len(cf, fi & CAN_DLC_MASK, 0);
 	id = readl(rcan->base + CAN_RX_ID);
 	if (fi & CAN_EFF)
 		id |= CAN_EFF_FLAG;
@@ -800,7 +801,7 @@ static int rockchip_can_remove(struct platform_device *pdev)
 #define CAN_ARBITFAIL               	0x0028 /* Arbit fail code register */
 #define CAN_ERROR_CODE              	0x002c /* Error code register */
 #define CAN_RXERRORCNT              	0x0034 /* Receive error counter */
-#define CAN_TXERRORCNT              	0x0038 /* Transmit error counter */
+#define CAN_TXERRORCNT              	0x0039 /* Transmit error counter */
 #define CAN_IDCODE                  	0x003c /* CAN controller's identifier */
 #define CAN_IDMASK                  	0x0040 /* Identification code bit mask register */
 #define CAN_TXFRAMEINFO             	0x0050 /* TX frame information configuration register */
@@ -934,14 +935,14 @@ static int rk3568_can_start(struct net_device *ndev)
 	/* Reset controller, ensure proper initial state */
 	rk3568_can_reset(rd);
 	/* Enable all interrupts */
-	writel(CAN_INT_MASK_NONE, rd->base + CAN_INT_MASK)
+	writel(CAN_INT_MASK_NONE, rd->base + CAN_INT_MASK);
 	/* Accept all messages ids */
-	writel(0, rd->base + CAN_ID);
+	writel(0, rd->base + CAN_RXID);
 	writel(CAN_RX_FILTER_MASK, rd->base + CAN_IDMASK);
 
 	/* Set bittimings */
 	rk3568_can_set_btt(ndev);
-	rk3568_can_normal(rd);
+	rk3568_can_work(rd);
 
 	rd->can.state = CAN_STATE_ERROR_ACTIVE;
 	dev_info(rd->dev, "CAN started!\n");
@@ -972,8 +973,6 @@ static int rk3568_can_open(struct net_device *ndev)
 static int rk3568_can_stop(struct net_device *ndev)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
-	int ret;
-	u16 ints;
 
 	netif_stop_queue(ndev);
 	rd->can.state = CAN_STATE_STOPPED;
@@ -994,7 +993,7 @@ static int rk3568_can_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	u32 data1 = 0;
 	u32 data2 = 0;
 
-	if (can_dropped_invalid_skb(ndev, skb);
+	if (can_dropped_invalid_skb(ndev, skb))
 		return NETDEV_TX_OK;
 
 	netif_stop_queue(ndev);
@@ -1049,9 +1048,13 @@ static void rk3568_can_rx(struct net_device *ndev)
 
 	struct can_frame *cf;
 	struct sk_buff *skb;
-
+	
+	canid_t id;
 	u8 rx_frm_info;
 	u8 len;
+	u32 data1 = 0;
+	u32 data2 = 0;
+
 
 	skb = alloc_can_skb(ndev, &cf);
 	if (!skb)
@@ -1059,6 +1062,121 @@ static void rk3568_can_rx(struct net_device *ndev)
 
 	rx_frm_info = readb(rd->base + CAN_RXFRAMEINFO);
 	len = rx_frm_info & 0xf;
+	id = readl(rd->base + CAN_RXID);
+
+	if (rx_frm_info & BIT(7))
+		id |= CAN_EFF_FLAG;
+
+
+	if (rx_frm_info & BIT(6))
+		id |= CAN_RTR_FLAG;
+	else {
+		data1 = readl(rd->base + CAN_RXDATA0);
+		data2 = readl(rd->base + CAN_RXDATA1);
+	}
+
+	cf->can_id = id;
+	cf->len = can_cc_dlc2len(len);
+	*((__le32 *)&cf->data[0]) = cpu_to_le32(data1);
+	*((__le32 *)&cf->data[4]) = cpu_to_le32(data2);
+
+	stats->rx_packets++;
+	stats->rx_bytes += cf->len;
+
+	netif_rx(skb);	
+
+	/* Clean registers here? They have been read already! */
+}
+
+static void rk3568_can_xmit_err(struct net_device *ndev, u8 intrs)
+{
+	struct rk3568_data *rd = netdev_priv(ndev);
+	struct net_device_stats *stats = &ndev->stats;
+
+	struct can_frame *cf;
+	struct sk_buff *skb;
+	enum can_state state;
+
+	u32 stater;
+	canid_t id;
+	u8 rx_frm_info;
+	u8 len;
+	u32 data1 = 0;
+	u32 data2 = 0;
+	u8 txerr;
+	u8 rxerr;
+	u32 errc;
+
+	skb = alloc_can_err_skb(ndev, &cf);
+	if (!skb) {
+		dev_err_ratelimited(rd->dev, "Can't allocate skb for error!\n");
+		return;
+	}
+
+	rx_frm_info = readb(rd->base + CAN_RXFRAMEINFO);
+	id = readl(rd->base + CAN_RXID);
+	len = can_cc_dlc2len(rx_frm_info & 0xf);
+
+	data1 = readl(rd->base + CAN_RXDATA0);
+	data2 = readl(rd->base + CAN_RXDATA1);
+
+	txerr = readb(rd->base + CAN_TXERRORCNT);
+	rxerr = readb(rd->base + CAN_RXERRORCNT);
+	stater = readl(rd->base + CAN_STATE);
+
+	stats->rx_packets++;
+	stats->rx_bytes += len;
+	
+	cf->data[6] = txerr;
+	cf->data[7] = rxerr;
+
+	/* Overload/Overflow */
+	if (intrs && BIT(3)) {
+		id |= CAN_ERR_CRTL;
+		cf->data[1] = CAN_ERR_CRTL_RX_OVERFLOW;
+		stats->rx_over_errors++;
+		stats->rx_errors++;
+
+		rk3568_can_reset(rd);
+		rk3568_can_work(rd);
+	}
+
+	if (intrs && BIT(2)) {
+		if (stater & BIT(5)) // Bus off
+			state = CAN_STATE_BUS_OFF;
+		else if (stater & BIT(4))
+			state = CAN_STATE_ERROR_WARNING;
+		else
+			state = CAN_STATE_ERROR_ACTIVE;
+	}
+
+	if (intrs & BIT(6)) {
+	//	make this can bus error stats->bus_errors++;
+		stats->rx_errors++;
+	  	errc = readl(rd->base + CAN_ERROR_CODE);
+		id |= CAN_ERR_PROT | CAN_ERR_BUSERROR;
+
+		switch ((errc && 0x1c000000) >> 26) {
+		case 0: // BIT error
+			cf->data[2] |= CAN_ERR_PROT_BIT;
+			break;
+		case 1: // BIT STUFF ERROR
+			cf->data[2] |= CAN_ERR_PROT_STUFF;
+			break;
+		case 2: // FORM ERROR
+			cf->data[2] |= CAN_ERR_PROT_FORM;
+			break;
+		default:
+			dev_info_ratelimited(rd->dev, "Unknow error errc:0x%08x\n", errc);
+		}
+		if (errc && BIT(25) == 0)
+			cf->data[2] |= CAN_ERR_PROT_TX;
+	}
+
+		
+	cf->can_id = id;
+
+	dev_info_ratelimited(rd->dev, "error handler intrs: %u\n", intrs);
 }
 
 static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
@@ -1067,6 +1185,7 @@ static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
 	struct rk3568_data *rd = netdev_priv(ndev);
 	struct net_device_stats *stats = &ndev->stats;
 
+	const u8 err_intr_mask = 0x7c; /* All aside RX_FINISH and TX_FINISH */
 	u8 intr = readb(rd->base + CAN_INT);
 
 	/* TX Finish */
@@ -1074,8 +1193,8 @@ static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
 		u8 bytes = readb(rd->base + CAN_TXFRAMEINFO);
 
 		/* Update statistics */
-		atomic_add((bytes & 0xf), &stats->tx_bytes);
-		atomic_inc(&stats->tx_packets);
+		stats->tx_bytes += can_cc_dlc2len((bytes & 0xf));
+		stats->tx_packets++;
 
 		/* Clear request */
 		writel(0, rd->base + CAN_CMD);
@@ -1086,7 +1205,11 @@ static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
 	}
 
 	if (intr & (1u << 0)) {
+		rk3568_can_rx(ndev);
+	}
 
+	if (intr & err_intr_mask) {
+		rk3568_can_xmit_err(ndev, intr);
 	}
 
 	writeb(intr, rd->base + CAN_INT);
@@ -1109,14 +1232,14 @@ static const struct can_bittiming_const rk3568_can_btt_const = {
 
 static int rk3568_can_set_mode(struct net_device *ndev, enum can_mode mode)
 {
-	struct rk2568_data *rd = netdev_priv(ndev);
+	struct rk3568_data *rd = netdev_priv(ndev);
 
 	dev_info(rd->dev, "CAN Set mode %u\n", mode);
 
 	switch (mode) {
 	case CAN_MODE_START:
 		rk3568_can_start(ndev);
-		if (netif_queue_stopped(ndev)
+		if (netif_queue_stopped(ndev))
 			netif_wake_queue(ndev);
 		break;
 
@@ -1130,13 +1253,13 @@ static int rk3568_can_set_mode(struct net_device *ndev, enum can_mode mode)
 	return 0;
 }
 
-static int rk3568_can_get_berr_counter(struct net_device *ndev,
+static int rk3568_can_get_berr_counter(const struct net_device *ndev,
 				       struct can_berr_counter *bec)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
 
-	bec->rxerr = readb(rd->base + CAN_RXERROR_CNT);
-	bec->txerr = readb(rd->base + CAN_TXERROR_CNT);
+	bec->rxerr = readb(rd->base + CAN_RXERRORCNT);
+	bec->txerr = readb(rd->base + CAN_TXERRORCNT);
 
 	dev_info(rd->dev, "CAN get error counters rx:%u tx:%u\n",
 		 bec->rxerr, bec->txerr);
@@ -1179,7 +1302,7 @@ static int rk3568_can_probe(struct platform_device *pdev)
 
 	/* Register all operations */
 	ndev->netdev_ops = &rk3568_can_netdev_ops;
-
+	rd->can.clock.freq = clk_get_rate(rd->clks[0].clk);
 	rd->can.bittiming_const = &rk3568_can_btt_const;
         rd->can.do_set_mode = rk3568_can_set_mode;
 	rd->can.do_get_berr_counter = rk3568_can_get_berr_counter;
