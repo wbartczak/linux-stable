@@ -104,8 +104,8 @@
 #define CAN_RX_FIFO_RDATA           	0x0400 /* This register gives the value read from RX FIFO */
 #define CAN_TXE_FIFO_RDATA          	0x0500 /* This register gives the value read from TX event FIFO */
 
-#define CAN_INT_MASK_ALL	0xefff
-#define CAN_INT_MASK_NONE	0x0000
+#define CAN_INT_MASK_ALL	0x0000efff
+#define CAN_INT_MASK_NONE	0x00000000
 
 #define CAN_RX_FILTER_MASK	0x1fffffff
 #define CAN_TX_ID_MASK		0x1fffffff
@@ -136,7 +136,7 @@ static void rk3568_can_reset(struct rk3568_data *rd)
 static void rk3568_can_work(struct rk3568_data *rd)
 {
 	u16 mode = readw(rd->base + CAN_MODE);
-	mode |= (1u << 0) | (1u << 10);
+	mode |= BIT(0) | BIT(10);
 
 	writew(mode, rd->base + CAN_MODE);
 }
@@ -168,7 +168,7 @@ static int rk3568_can_start(struct net_device *ndev)
 	/* Reset controller, ensure proper initial state */
 	rk3568_can_reset(rd);
 	/* Enable all interrupts */
-	writel(CAN_INT_MASK_NONE, rd->base + CAN_INT_MASK);
+	writel(0, rd->base + CAN_INT_MASK);
 	/* Accept all messages ids */
 	writel(0, rd->base + CAN_RXID);
 	writel(CAN_RX_FILTER_MASK, rd->base + CAN_IDMASK);
@@ -260,7 +260,7 @@ static int rk3568_can_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	can_put_echo_skb(skb, ndev, 0, 0);
 
 	/* Request transfer */
-	writel(1, rd->base + CAN_CMD);
+	writel(BIT(0), rd->base + CAN_CMD);
 
 	dev_info_ratelimited(rd->dev, "tx: can_id:0x%08x, dlc:%u, d0:0x%08x, d1:0x%08x\n",
 	                     cf->can_id, cf->len, data1, data2);
@@ -419,7 +419,9 @@ static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
 	struct net_device_stats *stats = &ndev->stats;
 
 	const u8 err_intr_mask = 0x7c; /* All aside RX_FINISH and TX_FINISH */
-	u8 intr = readb(rd->base + CAN_INT);
+	u32 intr = readl(rd->base + CAN_INT);
+	
+	dev_info(rd->dev, "intr 0x%08x\n", intr);
 
 	/* TX Finish */
 	if (intr & (1u << 1)) {
@@ -446,8 +448,6 @@ static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
 	}
 
 	writeb(intr, rd->base + CAN_INT);
-
-	dev_info_ratelimited(rd->dev, "intr 0x%08x\n", intr);
 
 	return IRQ_HANDLED;
 }
@@ -502,6 +502,36 @@ static int rk3568_can_get_berr_counter(const struct net_device *ndev,
 	return 0;
 }
 
+static ssize_t status_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct net_device *ndev = dev_get_drvdata(dev);
+	struct rk3568_data *rd = netdev_priv(ndev);
+
+	u32 cmdr;
+	u32 stater;
+
+	cmdr = readl(rd->base + CAN_CMD);
+	stater = readl(rd->base + CAN_STATE);
+
+	return sysfs_emit(buf, "cmd:0x%08x, state:0x%08x\n", cmdr, stater);
+}
+
+static DEVICE_ATTR_RO(status);
+
+static struct attribute *rk3568_can_attrs[] = {
+	&dev_attr_status.attr,
+	NULL,
+};
+
+static const struct attribute_group rk3568_can_attr_group = {
+	.attrs = rk3568_can_attrs,
+};
+
+static const struct attribute_group *rk3568_can_attr_groups[] = {
+	&rk3568_can_attr_group,
+	NULL,
+};	
+
 static int rk3568_can_probe(struct platform_device *pdev)
 {
 	struct net_device *ndev;
@@ -523,7 +553,7 @@ static int rk3568_can_probe(struct platform_device *pdev)
 
 	ndev = alloc_candev(sizeof(struct rk3568_data), 1);
 	if (!ndev) {
-		dev_err(&pdev->dev, "Can't allocate nework device");
+		dev_err(&pdev->dev, "Can't allocate nework device\n");
 		return -ENOMEM;
 	}
 
@@ -535,9 +565,9 @@ static int rk3568_can_probe(struct platform_device *pdev)
 	rd->dev = &pdev->dev;
 	rd->base = addr;
 
-	ret = devm_request_irq(&pdev->dev, irq, rk3568_can_intr, 0, "rk3568_can0", ndev);
+	ret = devm_request_irq(&pdev->dev, irq, rk3568_can_intr, "rk3568_can0", ndev);
 	if (ret) {
-		dev_err(&pdev->dev, "IRQ can't be registered");
+		dev_err(&pdev->dev, "IRQ can't be registered\n");
 		goto failure;
 	}
 
@@ -547,14 +577,14 @@ static int rk3568_can_probe(struct platform_device *pdev)
 
 		/* Ensure that reset controller is up and running */
 		if (ret != -EPROBE_DEFER)
-			dev_err(&pdev->dev, "Failed to get get reset lines!");
+			dev_err(&pdev->dev, "Failed to get get reset lines!\n");
 
 		goto failure;
 	}
 
 	rd->num_clks = devm_clk_bulk_get_all(&pdev->dev, &rd->clks);
 	if (rd->num_clks < 1) {
-		dev_err(&pdev->dev, "Clocks information not found!");
+		dev_err(&pdev->dev, "Clocks information not found!\n");
 
 		if (rd->num_clks < 0)
 			ret = rd->num_clks;
@@ -577,13 +607,19 @@ static int rk3568_can_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, ndev);
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 
-	ret = register_candev(ndev);
+	ret = devm_device_add_groups(&pdev->dev, rk3568_can_attr_groups);
 	if (ret) {
-		dev_err(&pdev->dev, "CAN driver can't be registered!");
+		dev_err(&pdev->dev, "Can't register extra attributes!\n");
 		goto failure;
 	}
 
-	dev_info(&pdev->dev, "CAN driver probed");
+	ret = register_candev(ndev);
+	if (ret) {
+		dev_err(&pdev->dev, "CAN driver can't be registered!\n");
+		goto failure;
+	}
+
+	dev_info(&pdev->dev, "CAN driver probed\n");
 
 	return 0;
 
@@ -598,7 +634,7 @@ static int rk3568_can_remove(struct platform_device *pdev)
 	struct net_device *ndev = platform_get_drvdata(pdev);
 
 	unregister_candev(ndev);
-	dev_info(&pdev->dev, "CAN driver removed");
+	dev_info(&pdev->dev, "CAN driver removed\n");
 
 	return 0;
 }
