@@ -25,9 +25,57 @@
 
 /* RK3568 CAN registers */
 #define CAN_MODE                    	0x0000 /* CAN controller working mode. configure register */
+
+#define CAN_MODE_FD_CAN                 BIT(15)
+#define CAN_MODE_DPEE                   BIT(14)
+#define CAN_MODE_BRSD                   BIT(13)
+#define CAN_MODE_SPACE_RX_MODE          BIT(12)
+#define CAN_MODE_AUTO_BUS_ON            BIT(11)
+#define CAN_MODE_AUTO_RETX_MODE         BIT(10)
+#define CAN_MODE_OVERLOAD_MODE          BIT(9)
+#define CAN_MODE_COVER_MODE             BIT(8)
+#define CAN_MODE_RXSORT_MODE            BIT(7)
+#define CAN_MODE_TXORDER_MODE           BIT(6)
+#define CAN_MODE_RXSTX_MODE             BIT(5)
+#define CAN_MODE_LOOPBACK_MODE          BIT(4)
+#define CAN_MODE_SILENT_MODE            BIT(3)
+#define CAN_MODE_SELF_TEST              BIT(2)
+#define CAN_MODE_SLEEP_MODE             BIT(1)
+#define CAN_MODE_WORK_MODE              BIT(0)
+
 #define CAN_CMD                     	0x0004 /* CAN command register */
+
+#define CAN_CMD_TX1_REQ			BIT(1)
+#define CAN_CMD_TX0_REQ			BIT(0)	/* Transmit enable request buffer0 */
+
 #define CAN_STATE                   	0x0008 /* CAN state register */
+
+#define CAN_STATE_SLEEP			BIT(6)	/* CAN controller is in sleep state */
+#define CAN_STATE_BUS_OFF		BIT(5)  /* CAN controller is in bus off state */
+#define CAN_STATE_ERROR_WARN		BIT(4)  /* Error waring state for CAN controller */
+#define CAN_STATE_TX_PERIOD		BIT(3)  /* Controller is transmiting data */
+#define CAN_STATE_RX_PERIOD		BIT(2)  /* Contriller is receiving data */
+#define CAN_STATE_TX_BUF_FULL		BIT(1)  /* TX buffer is full */
+#define CAN_STATE_RX_BUF_FULL		BIT(0)  /* RX buffer is full */
+
 #define CAN_INT                     	0x000c /* Interrupt state register */
+
+#define CAN_INT_WAKEUP                          BIT(14)
+#define CAN_INT_TX_EVENT_FIFO_FULL              BIT(13)
+#define CAN_INT_TX_EVENT_FIFO_OVERFLOW          BIT(12)
+#define CAN_INT_TIMESTAMP_COUNTER_OVERFLOW      BIT(11)
+#define CAN_INT_BUS_OFF_RECOVERY                BIT(10)
+#define CAN_INT_BUS_OFF                         BIT(9)
+#define CAN_INT_RX_EVENT_FIFO_OVERFLOW          BIT(8)
+#define CAN_INT_RX_EVENT_FIFO_FULL              BIT(7)
+#define CAN_INT_ERROR_OFF                       BIT(6)
+#define CAN_INT_TX_ARBIT_FAIL                   BIT(5)
+#define CAN_INT_PASSIVE_ERROR                   BIT(4)
+#define CAN_INT_OVERLOAD                        BIT(3)
+#define CAN_INT_ERROR_WARNING                   BIT(2)
+#define CAN_INT_TX_FINISH                       BIT(1)
+#define CAN_INT_RX_FINISH                       BIT(0)
+
 #define CAN_INT_MASK                	0x0010 /* Interrupt enable registers */
 #define CAN_DMA_CTRL                	0x0014 /* DMA mode control */
 #define CAN_BITTIMING               	0x0018 /* Bit timing configure register */
@@ -37,11 +85,19 @@
 #define CAN_TXERRORCNT              	0x0039 /* Transmit error counter */
 #define CAN_IDCODE                  	0x003c /* CAN controller's identifier */
 #define CAN_IDMASK                  	0x0040 /* Identification code bit mask register */
-#define CAN_TXFRAMEINFO             	0x0050 /* TX frame information configuration register */
+#define CAN_TXFRMINFO             	0x0050 /* TX frame information configuration register */
+
+#define CAN_FRMINFO_TX_EFF              BIT(7) /* Extende frame format */
+#define CAN_FRMINFO_TX_RTR              BIT(6) /* Remote transfer request */
+/* Data length encoded to DLC */
+#define CAN_FRMINFO_DATA_LEN_MASK       GENMASK(3, 0)
+#define CAN_FRMINFO_DATA_LEN(info)      ((info) & CAN_FRMINFO_DATA_LEN_MASK)
+
 #define CAN_TXID                    	0x0054 /* CAN controller transmit ID */
 #define CAN_TXDATA0                 	0x0058 /* CAN controller transmit DATA1 */
 #define CAN_TXDATA1                 	0x005c /* CAN controller transmit DATA1 */
-#define CAN_RXFRAMEINFO             	0x0060 /* RX frame information register. This register needs to be read (clear) before receiving the next frame. */
+#define CAN_RXFRMINFO             	0x0060 /* RX frame information register. This register needs to be read (clear) before receiving the next frame. */
+
 #define CAN_RXID                    	0x0064 /* CAN controller receive ID. This register needs to be read (clear) before receiving the next frame. */
 #define CAN_RXDATA0                 	0x0068 /* Receive Data Reg0. This register needs to be read (clear) before receiving the next frame. */
 #define CAN_RXDATA1                 	0x006c /* Receive Data Reg1. This register needs to be read (clear) before receiving the next frame. */
@@ -115,8 +171,8 @@ struct rk3568_data {
 	struct device *dev;
 	void __iomem *base;
 	struct reset_control *reset;
-	struct clk_bulk_data *clks;
-	int num_clks;
+	struct clk *pclk;
+	struct clk *baudclk;
 };
 
 /**
@@ -130,23 +186,17 @@ static void rk3568_can_reset(struct rk3568_data *rd)
 	udelay(2);
 	reset_control_deassert(rd->reset);
 
-	int ret = reset_control_status(rd->reset);
-	if (ret >= 0)
-		dev_info(rd->dev, "Reset status %s\n",
-			 ret == 0 ? "deasserted" : "asserted");
-
 	writel(0, rd->base + CAN_MODE);
 }
 
 static void rk3568_can_work(struct rk3568_data *rd)
 {
 	u32 mode = readl(rd->base + CAN_MODE);
-	mode |= BIT(0) | BIT(10);
-
+	mode |= CAN_MODE_WORK_MODE | CAN_MODE_AUTO_RETX_MODE
+		| CAN_MODE_AUTO_BUS_ON;
+		//| CAN_MODE_LOOPBACK_MODE | CAN_MODE_SELF_TEST;
+	
 	writel(mode, rd->base + CAN_MODE);
-
-	u32 confirm = readl(rd->base + CAN_MODE);
-	dev_info(rd->dev, "CAN mode work:0x%08x\n", confirm);
 }
 
 static int rk3568_can_set_btt(struct net_device *ndev)
@@ -162,10 +212,10 @@ static int rk3568_can_set_btt(struct net_device *ndev)
 		val |= 1 << 16;
 
 	writel(val, rd->base + CAN_BITTIMING);
-	
-	u32 confirm = readl(rd->base + CAN_BITTIMING); 
-	dev_info(rd->dev, "setting bittiming: 0x%08x, brp: %u, bitrate: %u, confirm:0x%08xn",
-		 val, btt->brp, btt->bitrate, confirm);
+	val = readl(rd->base + CAN_BITTIMING);
+
+	dev_info(rd->dev, "setting bittiming: 0x%04x, brp: %u, bitrate: %u\n",
+		 val, btt->brp, btt->bitrate);
 
 	return 0;
 }
@@ -173,17 +223,21 @@ static int rk3568_can_set_btt(struct net_device *ndev)
 static int rk3568_can_start(struct net_device *ndev)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
+	int ret;
 
 	/* Reset controller, ensure proper initial state */
 	rk3568_can_reset(rd);
+	
 	/* Enable all interrupts */
 	writel(0, rd->base + CAN_INT_MASK);
+
 	/* Accept all messages ids */
-	writel(0, rd->base + CAN_RXID);
+	writel(0, rd->base + CAN_IDCODE);
 	writel(CAN_RX_FILTER_MASK, rd->base + CAN_IDMASK);
 
 	/* Set bittimings */
 	rk3568_can_set_btt(ndev);
+
 	rk3568_can_work(rd);
 
 	rd->can.state = CAN_STATE_ERROR_ACTIVE;
@@ -203,7 +257,15 @@ static int rk3568_can_open(struct net_device *ndev)
 		return ret;
 	}
 
-	rk3568_can_start(ndev); /* This one can't fail */
+	ret = clk_enable(rd->baudclk);
+	if (ret) {
+		dev_err(rd->dev, "Can't enable baudclk\n");
+		return ret;
+	}
+
+	ret = rk3568_can_start(ndev);
+	if (ret)
+		return ret;
 
 	netif_start_queue(ndev);
 
@@ -234,6 +296,7 @@ static int rk3568_can_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	u8 tx_frm_info = 0;
 	u32 data1 = 0;
 	u32 data2 = 0;
+	u32 cmd;
 
 	if (can_dropped_invalid_skb(ndev, skb))
 		return NETDEV_TX_OK;
@@ -242,7 +305,7 @@ static int rk3568_can_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	/* Check frame properties */
 	if (cf->can_id & CAN_EFF_FLAG)
-		tx_frm_info |= 0x80;
+		tx_frm_info |= CAN_FRMINFO_TX_EFF;
 
 	/* Determines also message length */
 	if (!(cf->can_id & CAN_RTR_FLAG)) {
@@ -251,25 +314,25 @@ static int rk3568_can_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		data1 = __le32_to_cpup((__le32 *)&cf->data[0]);
 		data2 = __le32_to_cpup((__le32 *)&cf->data[4]);
 	} else {
-		tx_frm_info |= 0x40;
+		tx_frm_info |= CAN_FRMINFO_TX_RTR;
 	}
 
 	/* Clear requests */
-	writel(0, rd->base + CAN_CMD);
+	cmd = readl(rd->base + CAN_CMD);
+	writel(cmd & (~CAN_CMD_TX0_REQ), rd->base + CAN_CMD);
+	
 	/* Write ID */
 	writel(cf->can_id & CAN_TX_ID_MASK, rd->base + CAN_TXID);
-	/* Write data if available */
-	if (!(cf->can_id & CAN_RTR_FLAG)) {
-		writel(data1, rd->base + CAN_TXDATA0);
-		writel(data2, rd->base + CAN_TXDATA1);
-	}
+	writel(data1, rd->base + CAN_TXDATA0);
+	writel(data2, rd->base + CAN_TXDATA1);
 	/* Write additional packet information */
-	writeb(tx_frm_info, rd->base + CAN_TXFRAMEINFO);
+	writeb(tx_frm_info, rd->base + CAN_TXFRMINFO);
 	/* Start packet processing */
 	can_put_echo_skb(skb, ndev, 0, 0);
 
 	/* Request transfer */
-	writel(BIT(0), rd->base + CAN_CMD);
+	cmd = readl(rd->base + CAN_CMD);
+	writel(cmd | CAN_CMD_TX0_REQ, rd->base + CAN_CMD);
 
 	dev_info_ratelimited(rd->dev, "tx: can_id:0x%08x, dlc:%u, d0:0x%08x, d1:0x%08x\n",
 	                     cf->can_id, cf->len, data1, data2);
@@ -283,54 +346,7 @@ static const struct net_device_ops rk3568_can_netdev_ops = {
 	.ndo_start_xmit = rk3568_can_start_xmit,
 };
 
-static void rk3568_can_rx(struct net_device *ndev)
-{
-	struct rk3568_data *rd = netdev_priv(ndev);
-	struct net_device_stats *stats = &ndev->stats;
-
-	struct can_frame *cf;
-	struct sk_buff *skb;
-	
-	canid_t id;
-	u8 rx_frm_info;
-	u8 len;
-	u32 data1 = 0;
-	u32 data2 = 0;
-
-
-	skb = alloc_can_skb(ndev, &cf);
-	if (!skb)
-		return;
-
-	rx_frm_info = readb(rd->base + CAN_RXFRAMEINFO);
-	len = rx_frm_info & 0xf;
-	id = readl(rd->base + CAN_RXID);
-
-	if (rx_frm_info & BIT(7))
-		id |= CAN_EFF_FLAG;
-
-
-	if (rx_frm_info & BIT(6))
-		id |= CAN_RTR_FLAG;
-	else {
-		data1 = readl(rd->base + CAN_RXDATA0);
-		data2 = readl(rd->base + CAN_RXDATA1);
-	}
-
-	cf->can_id = id;
-	cf->len = can_cc_dlc2len(len);
-	*((__le32 *)&cf->data[0]) = cpu_to_le32(data1);
-	*((__le32 *)&cf->data[4]) = cpu_to_le32(data2);
-
-	stats->rx_packets++;
-	stats->rx_bytes += cf->len;
-
-	netif_rx(skb);	
-
-	/* Clean registers here? They have been read already! */
-}
-
-static void rk3568_can_xmit_err(struct net_device *ndev, u8 intrs)
+static void rk3568_can_error(struct net_device *ndev, u32 intrs)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
 	struct net_device_stats *stats = &ndev->stats;
@@ -355,7 +371,7 @@ static void rk3568_can_xmit_err(struct net_device *ndev, u8 intrs)
 		return;
 	}
 
-	rx_frm_info = readb(rd->base + CAN_RXFRAMEINFO);
+	rx_frm_info = readb(rd->base + CAN_RXFRMINFO);
 	id = readl(rd->base + CAN_RXID);
 	len = can_cc_dlc2len(rx_frm_info & 0xf);
 
@@ -418,47 +434,113 @@ static void rk3568_can_xmit_err(struct net_device *ndev, u8 intrs)
 		
 	cf->can_id = id;
 
-	dev_info_ratelimited(rd->dev, "error handler intrs: %u\n", intrs);
+	dev_info_ratelimited(rd->dev, "error handler intrs: 0x%08x\n", intrs);
+}
+
+static irqreturn_t rk3568_can_tx_finish(struct net_device *ndev)
+{
+	struct rk3568_data *rd = netdev_priv(ndev);
+	struct net_device_stats *stats = &ndev->stats;
+	int ret;
+
+	u32 tx_info = readl(rd->base + CAN_TXFRMINFO);
+	u32 tx_cmd = readl(rd->base + CAN_CMD);
+	unsigned long bytes = can_cc_dlc2len(CAN_FRMINFO_DATA_LEN(tx_info));
+	
+	/* Clear request flag */
+	writel(tx_cmd & (~CAN_CMD_TX0_REQ), rd->base + CAN_CMD);
+
+	ret = can_get_echo_skb(ndev, 0, NULL);
+	if (!ret) {
+		dev_info_ratelimited(rd->dev, "Incomming packet dropped\n");
+	} else {
+		stats->tx_bytes += bytes;
+		stats->tx_packets++;
+	}
+	netif_wake_queue(ndev);
+
+	return IRQ_HANDLED;
+}
+
+static void rk3568_can_rx_finish(struct net_device *ndev)
+{
+	struct rk3568_data *rd = netdev_priv(ndev);
+	struct net_device_stats *stats = &ndev->stats;
+
+	struct can_frame *cf;
+	struct sk_buff *skb;
+	
+	uint32_t rx_info;
+	canid_t id;
+
+	unsigned long len;
+	u32 data1 = 0;
+	u32 data2 = 0;
+
+	skb = alloc_can_skb(ndev, &cf);
+	if (!skb) {
+		dev_info_ratelimited(rd->dev, "RX frame dropped skb=NULL\n");
+		goto failure;
+	}
+
+	rx_info = readl(rd->base + CAN_RXFRMINFO);
+	len = can_cc_dlc2len(CAN_FRMINFO_DATA_LEN(rx_info));
+	id = readl(rd->base + CAN_RXID);
+
+	if (rx_info & CAN_FRMINFO_TX_EFF)
+		id |= CAN_EFF_FLAG;
+
+
+	if (rx_info & CAN_FRMINFO_TX_RTR) {
+		id |= CAN_RTR_FLAG;
+		/* No data for RTR, but have to read  to clear int */
+       		(void) readl(rd->base + CAN_RXDATA0);
+		(void) readl(rd->base + CAN_RXDATA1);	
+	} else {
+		data1 = readl(rd->base + CAN_RXDATA0);
+		data2 = readl(rd->base + CAN_RXDATA1);
+	}
+
+	cf->can_id = id;
+	cf->len = len;
+	*((__le32 *)&cf->data[0]) = cpu_to_le32(data1);
+	*((__le32 *)&cf->data[4]) = cpu_to_le32(data2);
+
+	stats->rx_packets++;
+	stats->rx_bytes += cf->len;
+
+	netif_rx(skb);	
+
+	return;
+
+failure:
+	(void) readl(rd->base + CAN_RXFRMINFO);
+	(void) readl(rd->base + CAN_RXID);
+	(void) readl(rd->base + CAN_RXDATA0);
+	(void) readl(rd->base + CAN_RXDATA1);
 }
 
 static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
 {
 	struct net_device *ndev = (struct net_device *)dev_id;
 	struct rk3568_data *rd = netdev_priv(ndev);
-	struct net_device_stats *stats = &ndev->stats;
 
-	const u8 err_intr_mask = 0x7c; /* All aside RX_FINISH and TX_FINISH */
+	const u32 err_intr_mask = 0x7ffc; /* All aside RX_FINISH and TX_FINISH */
 	u32 intr = readl(rd->base + CAN_INT);
-	
-	dev_info(rd->dev, "intr 0x%08x\n", intr);
+	irqreturn_t ret = IRQ_HANDLED;
 
-	/* TX Finish */
-	if (intr & (1u << 1)) {
-		u8 bytes = readb(rd->base + CAN_TXFRAMEINFO);
+	if (intr & CAN_INT_TX_FINISH)
+		ret = rk3568_can_tx_finish(ndev);  
 
-		/* Update statistics */
-		stats->tx_bytes += can_cc_dlc2len((bytes & 0xf));
-		stats->tx_packets++;
+	if (intr & CAN_INT_RX_FINISH)
+		rk3568_can_rx_finish(ndev);
 
-		/* Clear request */
-		writel(0, rd->base + CAN_CMD);
-		/* Make skb available */
-		can_get_echo_skb(ndev, 0, NULL);
-		/* Resume sending data */
-		netif_wake_queue(ndev);
-	}
-
-	if (intr & (1u << 0)) {
-		rk3568_can_rx(ndev);
-	}
-
-	if (intr & err_intr_mask) {
-		rk3568_can_xmit_err(ndev, intr);
-	}
+	if (intr & err_intr_mask)
+		rk3568_can_error(ndev, intr);
 
 	writeb(intr, rd->base + CAN_INT);
 
-	return IRQ_HANDLED;
+	return ret;
 }
 
 /* Bit timing structure */
@@ -511,23 +593,42 @@ static int rk3568_can_get_berr_counter(const struct net_device *ndev,
 	return 0;
 }
 
+static ssize_t settings_show(struct device *dev, struct device_attribute *atr, char *buf)
+{
+	struct net_device *ndev = dev_get_drvdata(dev);
+	struct rk3568_data *rd = netdev_priv(ndev);
+
+	u32 btt = readl(rd->base + CAN_BITTIMING);
+	u32 mode = readl(rd->base + CAN_MODE);
+
+	return sysfs_emit(buf, "mode:0x%x, btt:0x%x\n", mode, btt);
+}
+static DEVICE_ATTR_RO(settings);
+
+
 static ssize_t status_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct net_device *ndev = dev_get_drvdata(dev);
 	struct rk3568_data *rd = netdev_priv(ndev);
 
-	u32 cmdr;
+	u32 intr;
 	u32 stater;
+	u32 arbitfailr;
+	u32 errcr;
 
-	cmdr = readl(rd->base + CAN_CMD);
+	intr = readl(rd->base + CAN_INT);
 	stater = readl(rd->base + CAN_STATE);
+	arbitfailr = readl(rd->base + CAN_ARBITFAIL);
+	errcr = readl(rd->base + CAN_ERROR_CODE);	
 
-	return sysfs_emit(buf, "cmd:0x%08x, state:0x%08x\n", cmdr, stater);
+	return sysfs_emit(buf, "intr:0x%x, state:0x%x, arbt:0x%x, errc:0x%x\n",
+			  intr, stater, arbitfailr, errcr);
 }
 
 static DEVICE_ATTR_RO(status);
 
 static struct attribute *rk3568_can_attrs[] = {
+	&dev_attr_settings.attr,
 	&dev_attr_status.attr,
 	NULL,
 };
@@ -591,15 +692,37 @@ static int rk3568_can_probe(struct platform_device *pdev)
 		goto failure;
 	}
 
-	rd->num_clks = devm_clk_bulk_get_all(&pdev->dev, &rd->clks);
-	if (rd->num_clks < 1) {
-		dev_err(&pdev->dev, "Clocks information not found!\n");
 
-		if (rd->num_clks < 0)
-			ret = rd->num_clks;
-		else
-			ret = -EINVAL;
+	rd->pclk = of_clk_get(pdev->dev.of_node, 1);
+	if (IS_ERR_OR_NULL(rd->pclk)) {
+		ret = PTR_ERR(rd->pclk);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+			
+		dev_err(&pdev->dev, "Can't find apb_pclk\n");
+		goto failure;
+	}
 
+	rd->baudclk = of_clk_get(pdev->dev.of_node, 0);
+	if (IS_ERR_OR_NULL(rd->baudclk)) {
+		ret = PTR_ERR(rd->baudclk);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+		dev_err(&pdev->dev, "Can't find baudclk\n");
+		goto failure;
+	}
+
+	/* Start pclk */
+	ret = clk_prepare_enable(rd->pclk);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't start pclk\n");
+		goto failure;
+	}
+
+	/* Prepare baudclk, enable during open */
+	ret = clk_prepare(rd->baudclk);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't prepare baudclk\n");
 		goto failure;
 	}
 
@@ -616,11 +739,13 @@ static int rk3568_can_probe(struct platform_device *pdev)
 	/* Register all operations */
 	ndev->netdev_ops = &rk3568_can_netdev_ops;
 	
-	rd->can.clock.freq = clk_get_rate(rd->clks[0].clk);
+	rd->can.clock.freq = clk_get_rate(rd->baudclk);
 	rd->can.bittiming_const = &rk3568_can_btt_const;
         rd->can.do_set_mode = rk3568_can_set_mode;
 	rd->can.do_get_berr_counter = rk3568_can_get_berr_counter;
 	rd->can.ctrlmode_supported = CAN_CTRLMODE_BERR_REPORTING |
+				     CAN_CTRLMODE_LISTENONLY |
+				     CAN_CTRLMODE_LOOPBACK |
 		                     CAN_CTRLMODE_3_SAMPLES;
 
 	platform_set_drvdata(pdev, ndev);
