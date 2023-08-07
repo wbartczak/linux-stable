@@ -192,9 +192,8 @@ static void rk3568_can_reset(struct rk3568_data *rd)
 static void rk3568_can_work(struct rk3568_data *rd)
 {
 	u32 mode = readl(rd->base + CAN_MODE);
-	mode |= CAN_MODE_WORK_MODE | CAN_MODE_AUTO_RETX_MODE
-		| CAN_MODE_AUTO_BUS_ON;
-		//| CAN_MODE_LOOPBACK_MODE | CAN_MODE_SELF_TEST;
+	mode |= CAN_MODE_WORK_MODE | CAN_MODE_AUTO_RETX_MODE;
+	//	| CAN_MODE_LOOPBACK_MODE | CAN_MODE_SELF_TEST;
 	
 	writel(mode, rd->base + CAN_MODE);
 }
@@ -724,16 +723,6 @@ static int rk3568_can_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(&pdev->dev, "Can't prepare baudclk\n");
 		goto failure;
-	}
-
-	dev_info(&pdev->dev, "Got %d clocks\n", rd->num_clks);
-
-	for (int i = 0; i < rd->num_clks; i++) {
-		ret = clk_prepare_enable(rd->clks[i].clk);
-		if (ret) {
-			dev_err(&pdev->dev, "Can't enable clock %d\n", i);
-			goto failure;
-		}
 	}
 
 	/* Register all operations */
