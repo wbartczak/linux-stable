@@ -192,9 +192,8 @@ static void rk3568_can_reset(struct rk3568_data *rd)
 static void rk3568_can_work(struct rk3568_data *rd)
 {
 	u32 mode = readl(rd->base + CAN_MODE);
-	mode |= CAN_MODE_WORK_MODE | CAN_MODE_AUTO_RETX_MODE;
-	//	| CAN_MODE_LOOPBACK_MODE | CAN_MODE_SELF_TEST;
-	
+	mode |= CAN_MODE_WORK_MODE; // | CAN_MODE_AUTO_RETX_MODE;
+
 	writel(mode, rd->base + CAN_MODE);
 }
 
@@ -222,7 +221,6 @@ static int rk3568_can_set_btt(struct net_device *ndev)
 static int rk3568_can_start(struct net_device *ndev)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
-	int ret;
 
 	/* Reset controller, ensure proper initial state */
 	rk3568_can_reset(rd);
@@ -345,6 +343,7 @@ static const struct net_device_ops rk3568_can_netdev_ops = {
 	.ndo_start_xmit = rk3568_can_start_xmit,
 };
 
+#if 0
 static void rk3568_can_error(struct net_device *ndev, u32 intrs)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
@@ -435,6 +434,7 @@ static void rk3568_can_error(struct net_device *ndev, u32 intrs)
 
 	dev_info_ratelimited(rd->dev, "error handler intrs: 0x%08x\n", intrs);
 }
+#endif
 
 static irqreturn_t rk3568_can_tx_finish(struct net_device *ndev)
 {
@@ -461,7 +461,7 @@ static irqreturn_t rk3568_can_tx_finish(struct net_device *ndev)
 	return IRQ_HANDLED;
 }
 
-static void rk3568_can_rx_finish(struct net_device *ndev)
+static irqreturn_t rk3568_can_rx_finish(struct net_device *ndev)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
 	struct net_device_stats *stats = &ndev->stats;
@@ -510,34 +510,41 @@ static void rk3568_can_rx_finish(struct net_device *ndev)
 
 	netif_rx(skb);	
 
-	return;
+	return IRQ_HANDLED;
 
 failure:
 	(void) readl(rd->base + CAN_RXFRMINFO);
 	(void) readl(rd->base + CAN_RXID);
 	(void) readl(rd->base + CAN_RXDATA0);
 	(void) readl(rd->base + CAN_RXDATA1);
+
+	return IRQ_HANDLED;
 }
 
 static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
 {
+	const u32 err_intr_mask = 0x7ffc; /* All aside RX_FINISH and TX_FINISH */
 	struct net_device *ndev = (struct net_device *)dev_id;
 	struct rk3568_data *rd = netdev_priv(ndev);
-
-	const u32 err_intr_mask = 0x7ffc; /* All aside RX_FINISH and TX_FINISH */
-	u32 intr = readl(rd->base + CAN_INT);
 	irqreturn_t ret = IRQ_HANDLED;
+
+	u32 intr = readl(rd->base + CAN_INT);
 
 	if (intr & CAN_INT_TX_FINISH)
 		ret = rk3568_can_tx_finish(ndev);  
 
 	if (intr & CAN_INT_RX_FINISH)
-		rk3568_can_rx_finish(ndev);
+		ret = rk3568_can_rx_finish(ndev);
 
+	if (intr & err_intr_mask) {
+		dev_info_ratelimited(rd->dev, "error: 0x%x\n", intr);
+	}
+#if 0
 	if (intr & err_intr_mask)
 		rk3568_can_error(ndev, intr);
+#endif
 
-	writeb(intr, rd->base + CAN_INT);
+	writel(intr, rd->base + CAN_INT);
 
 	return ret;
 }
