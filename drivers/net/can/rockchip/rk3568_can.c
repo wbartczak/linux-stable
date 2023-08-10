@@ -50,13 +50,13 @@
 
 #define CAN_STATE                   	0x0008 /* CAN state register */
 
-#define CAN_STATE_SLEEP			BIT(6)	/* CAN controller is in sleep state */
-#define CAN_STATE_BUS_OFF		BIT(5)  /* CAN controller is in bus off state */
-#define CAN_STATE_ERROR_WARN		BIT(4)  /* Error waring state for CAN controller */
-#define CAN_STATE_TX_PERIOD		BIT(3)  /* Controller is transmiting data */
-#define CAN_STATE_RX_PERIOD		BIT(2)  /* Contriller is receiving data */
-#define CAN_STATE_TX_BUF_FULL		BIT(1)  /* TX buffer is full */
-#define CAN_STATE_RX_BUF_FULL		BIT(0)  /* RX buffer is full */
+#define CAN_SLEEP			BIT(6)	/* CAN controller is in sleep state */
+#define CAN_BUS_OFF			BIT(5)  /* CAN controller is in bus off state */
+#define CAN_ERROR_WARN			BIT(4)  /* Error waring state for CAN controller */
+#define CAN_TX_PERIOD			BIT(3)  /* Controller is transmiting data */
+#define CAN_RX_PERIOD			BIT(2)  /* Contriller is receiving data */
+#define CAN_TX_BUF_FULL			BIT(1)  /* TX buffer is full */
+#define CAN_RX_BUF_FULL			BIT(1)  /* RX buffer is full */
 
 #define CAN_INT                     	0x000c /* Interrupt state register */
 
@@ -81,8 +81,33 @@
 #define CAN_BITTIMING               	0x0018 /* Bit timing configure register */
 #define CAN_ARBITFAIL               	0x0028 /* Arbit fail code register */
 #define CAN_ERROR_CODE              	0x002c /* Error code register */
+
+/* Error type macros for CAN_ERROR_CODE register */
+#define CAN_ERROR_PHASE			BIT(29)
+#define CAN_ERROR_TYPE_MASK		GENMASK(28, 26)
+#define CAN_ERROR_TYPE_SHIFT		26
+#define CAN_ERROR_TYPE(errc) \
+	((errc) & CAN_ERROR_TYPE_MASK >> CAN_ERROR_TYPE_SHIFT)
+
+/* Types of errors in CAN_ERROR_TYPE */
+#define CAN_ERROR_TYPE_BIT		0u
+#define CAN_ERROR_TYPE_BIT_STUFF	1u
+#define CAN_ERROR_TYPE_FORM		2u
+#define CAN_ERROR_TYPE_ACK		3u
+#define CAN_ERROR_TYPE_CRC		4u
+
+#define CAN_ERROR_DIR			BIT(25)
+#define CAN_ERROR_TX_POS_MASK		GENMASK(24,16)
+#define CAN_ERROR_TX_POS_SHIFT		16
+#define CAN_ERROR_TX_POS(errc) \
+	((errc) & CAN_ERROR_TX_POS_MASK >> CAN_ERROR_TX_POS_SHIFT)
+#define CAN_ERROR_RX_POS_MASK		GENMASK(15,0)
+#define CAN_ERROR_RX_POS_SHIFT		0
+#define CAN_ERROR_RX_POS(errc) \
+	((errc) & CAN_ERROR_TX_POS_MASK >> CAN_ERROR_TX_POS_SHIFT)
+	
 #define CAN_RXERRORCNT              	0x0034 /* Receive error counter */
-#define CAN_TXERRORCNT              	0x0039 /* Transmit error counter */
+#define CAN_TXERRORCNT              	0x0038 /* Transmit error counter */
 #define CAN_IDCODE                  	0x003c /* CAN controller's identifier */
 #define CAN_IDMASK                  	0x0040 /* Identification code bit mask register */
 #define CAN_TXFRMINFO             	0x0050 /* TX frame information configuration register */
@@ -343,98 +368,158 @@ static const struct net_device_ops rk3568_can_netdev_ops = {
 	.ndo_start_xmit = rk3568_can_start_xmit,
 };
 
-#if 0
-static void rk3568_can_error(struct net_device *ndev, u32 intrs)
+
+
+/* Handle overload */
+static void rk3568_can_err_bus_overload(struct net_device *ndev,
+					struct can_frame *cf,
+					u32 rxerr, u32 txerr)
+{
+	struct rk3568_data *rd = netdev_priv(ndev);
+
+	cf->can_id |= CAN_ERR_CRTL;
+	cf->data[1] = CAN_ERR_CRTL_RX_OVERFLOW;
+
+	rk3568_can_reset(rd);
+	rk3568_can_work(rd);
+}
+
+/* Handle state */
+static void rk3568_can_err_bus_state(struct net_device *ndev,
+				     struct can_frame *cf,
+				     u32 rxerr, u32 txerr,
+				     int passive_err)
+{
+	struct rk3568_data *rd = netdev_priv(ndev);
+	enum can_state nstate = rd->can.state;
+	u32 state_reg = readl(rd->base + CAN_STATE);
+
+	if (state_reg & CAN_BUS_OFF)
+		nstate = CAN_STATE_BUS_OFF;
+	else if (state_reg & CAN_ERROR_WARN)
+		nstate = CAN_STATE_ERROR_WARNING;
+	else
+		nstate = CAN_STATE_ERROR_ACTIVE;
+
+	if (passive_err) {
+		if (nstate == CAN_STATE_ERROR_PASSIVE)
+			nstate = CAN_STATE_ERROR_WARNING;
+		else
+			nstate = CAN_STATE_ERROR_PASSIVE;
+	}
+
+	if (nstate != rd->can.state) {
+		enum can_state txstate, rxstate;
+
+		txstate = txerr >= rxerr ? nstate : 0;
+		rxstate = txerr <= rxerr ? nstate : 0;
+		can_change_state(ndev, cf, txstate, rxstate);
+
+		if (nstate == CAN_STATE_BUS_OFF)
+			can_bus_off(ndev);
+	}
+}
+
+/* Handle arbitration lost */
+static void rk3568_can_err_arbitration_lost(struct net_device *ndev,
+					    struct can_frame *cf)
+{
+	struct rk3568_data *rd = netdev_priv(ndev);
+	u32 arb_lost_code = readl(rd->base + CAN_ARBITFAIL);
+
+	rd->can.can_stats.arbitration_lost++;
+	cf->can_id |= CAN_ERR_LOSTARB;
+	cf->data[0] = arb_lost_code;	
+}
+
+static void rk3568_can_err_bus_error(struct net_device *ndev,
+				     struct can_frame *cf)
+{
+	struct rk3568_data *rd = netdev_priv(ndev);
+	u32 errc = readl(rd->base + CAN_ERROR_CODE);
+
+	cf->can_id |= CAN_ERR_PROT | CAN_ERR_BUSERROR;
+	rd->can.can_stats.bus_error++;
+	
+	switch (CAN_ERROR_TYPE(errc)) {
+		case CAN_ERROR_TYPE_BIT:
+			cf->data[2] |= CAN_ERR_PROT_BIT;
+			break;
+		case CAN_ERROR_TYPE_BIT_STUFF:
+			cf->data[2] |= CAN_ERR_PROT_STUFF;
+			break;
+		case CAN_ERROR_TYPE_FORM:
+			cf->data[2] |= CAN_ERR_PROT_FORM;
+			break;
+		default:
+			break;
+
+	}
+
+	if ((errc & CAN_ERROR_DIR) == 0)
+		cf->data[2] |= CAN_ERR_PROT_TX;
+
+	dev_info_ratelimited(rd->dev, "bus error: 0x%08x\n", errc);	
+}
+
+static int rk3568_can_err(struct net_device *ndev, u32 intrs)
 {
 	struct rk3568_data *rd = netdev_priv(ndev);
 	struct net_device_stats *stats = &ndev->stats;
 
 	struct can_frame *cf;
 	struct sk_buff *skb;
-	enum can_state state;
 
-	u32 stater;
-	canid_t id;
-	u8 rx_frm_info;
-	u8 len;
-	u32 data1 = 0;
-	u32 data2 = 0;
-	u8 txerr;
-	u8 rxerr;
-	u32 errc;
+	u32 txerr;
+	u32 rxerr;
 
 	skb = alloc_can_err_skb(ndev, &cf);
 	if (!skb) {
 		dev_err_ratelimited(rd->dev, "Can't allocate skb for error!\n");
-		return;
+		return IRQ_HANDLED;
+	}
+	
+	rxerr = readl(rd->base + CAN_RXERRORCNT);
+	txerr = readl(rd->base + CAN_TXERRORCNT);
+
+	if (intrs & CAN_INT_OVERLOAD) {
+		dev_info_ratelimited(rd->dev, "data overrun\n");
+
+		stats->rx_over_errors++;
+		stats->rx_errors++;
+
+		rk3568_can_err_bus_overload(ndev, cf, rxerr, txerr); 
 	}
 
-	rx_frm_info = readb(rd->base + CAN_RXFRMINFO);
-	id = readl(rd->base + CAN_RXID);
-	len = can_cc_dlc2len(rx_frm_info & 0xf);
+	if (intrs & CAN_INT_ERROR_OFF) {
+		
+		stats->rx_errors++;
 
-	data1 = readl(rd->base + CAN_RXDATA0);
-	data2 = readl(rd->base + CAN_RXDATA1);
+		rk3568_can_err_bus_error(ndev, cf);
+	}
 
-	txerr = readb(rd->base + CAN_TXERRORCNT);
-	rxerr = readb(rd->base + CAN_RXERRORCNT);
-	stater = readl(rd->base + CAN_STATE);
+	if (intrs & CAN_INT_TX_ARBIT_FAIL) {
+		dev_info_ratelimited(rd->dev, "arbitration lost\n");
+		stats->tx_errors++;
 
-	stats->rx_packets++;
-	stats->rx_bytes += len;
+		rk3568_can_err_arbitration_lost(ndev, cf);
+	}
+
+	if ((intrs & CAN_INT_ERROR_WARNING) || (intrs & CAN_INT_BUS_OFF)) {
+		dev_info_ratelimited(rd->dev, "error warn/passiv_err\n");
+		rk3568_can_err_bus_state(ndev, cf, rxerr, txerr,
+					 (intrs & CAN_INT_PASSIVE_ERROR) != 0);
+	}
 	
 	cf->data[6] = txerr;
 	cf->data[7] = rxerr;
 
-	/* Overload/Overflow */
-	if (intrs && BIT(3)) {
-		id |= CAN_ERR_CRTL;
-		cf->data[1] = CAN_ERR_CRTL_RX_OVERFLOW;
-		stats->rx_over_errors++;
-		stats->rx_errors++;
+	stats->rx_packets++;
+	stats->rx_bytes += cf->can_dlc;
+	netif_rx(skb);
 
-		rk3568_can_reset(rd);
-		rk3568_can_work(rd);
-	}
-
-	if (intrs && BIT(2)) {
-		if (stater & BIT(5)) // Bus off
-			state = CAN_STATE_BUS_OFF;
-		else if (stater & BIT(4))
-			state = CAN_STATE_ERROR_WARNING;
-		else
-			state = CAN_STATE_ERROR_ACTIVE;
-	}
-
-	if (intrs & BIT(6)) {
-	//	make this can bus error stats->bus_errors++;
-		stats->rx_errors++;
-	  	errc = readl(rd->base + CAN_ERROR_CODE);
-		id |= CAN_ERR_PROT | CAN_ERR_BUSERROR;
-
-		switch ((errc && 0x1c000000) >> 26) {
-		case 0: // BIT error
-			cf->data[2] |= CAN_ERR_PROT_BIT;
-			break;
-		case 1: // BIT STUFF ERROR
-			cf->data[2] |= CAN_ERR_PROT_STUFF;
-			break;
-		case 2: // FORM ERROR
-			cf->data[2] |= CAN_ERR_PROT_FORM;
-			break;
-		default:
-			dev_info_ratelimited(rd->dev, "Unknow error errc:0x%08x\n", errc);
-		}
-		if (errc && BIT(25) == 0)
-			cf->data[2] |= CAN_ERR_PROT_TX;
-	}
-
-		
-	cf->can_id = id;
-
-	dev_info_ratelimited(rd->dev, "error handler intrs: 0x%08x\n", intrs);
+	return IRQ_HANDLED;
 }
-#endif
 
 static irqreturn_t rk3568_can_tx_finish(struct net_device *ndev)
 {
@@ -442,6 +527,7 @@ static irqreturn_t rk3568_can_tx_finish(struct net_device *ndev)
 	struct net_device_stats *stats = &ndev->stats;
 	int ret;
 
+	dev_info_ratelimited(rd->dev, "tx finish\n");
 	u32 tx_info = readl(rd->base + CAN_TXFRMINFO);
 	u32 tx_cmd = readl(rd->base + CAN_CMD);
 	unsigned long bytes = can_cc_dlc2len(CAN_FRMINFO_DATA_LEN(tx_info));
@@ -492,7 +578,7 @@ static irqreturn_t rk3568_can_rx_finish(struct net_device *ndev)
 
 	if (rx_info & CAN_FRMINFO_TX_RTR) {
 		id |= CAN_RTR_FLAG;
-		/* No data for RTR, but have to read  to clear int */
+		/* No data for RTR, but have to read data to clear buffer */
        		(void) readl(rd->base + CAN_RXDATA0);
 		(void) readl(rd->base + CAN_RXDATA1);	
 	} else {
@@ -523,30 +609,24 @@ failure:
 
 static irqreturn_t rk3568_can_intr(int irq, void *dev_id)
 {
-	const u32 err_intr_mask = 0x7ffc; /* All aside RX_FINISH and TX_FINISH */
 	struct net_device *ndev = (struct net_device *)dev_id;
 	struct rk3568_data *rd = netdev_priv(ndev);
-	irqreturn_t ret = IRQ_HANDLED;
+	const u32 err_intr_mask = 0x7ffc; /* All aside RX_FINISH and TX_FINISH */
 
 	u32 intr = readl(rd->base + CAN_INT);
 
 	if (intr & CAN_INT_TX_FINISH)
-		ret = rk3568_can_tx_finish(ndev);  
+		rk3568_can_tx_finish(ndev);  
 
 	if (intr & CAN_INT_RX_FINISH)
-		ret = rk3568_can_rx_finish(ndev);
+		rk3568_can_rx_finish(ndev);
 
-	if (intr & err_intr_mask) {
-		dev_info_ratelimited(rd->dev, "error: 0x%x\n", intr);
-	}
-#if 0
 	if (intr & err_intr_mask)
-		rk3568_can_error(ndev, intr);
-#endif
+		rk3568_can_err(ndev, intr);
 
 	writel(intr, rd->base + CAN_INT);
 
-	return ret;
+	return IRQ_HANDLED;
 }
 
 /* Bit timing structure */
@@ -680,6 +760,8 @@ static int rk3568_can_probe(struct platform_device *pdev)
 	rd = netdev_priv(ndev);
 	rd->dev = &pdev->dev;
 	rd->base = addr;
+
+	dev_info(&pdev->dev, "addr:%pK\n", rd->base);
 
 	ret = devm_request_irq(&pdev->dev, irq, rk3568_can_intr, 0, "rk3568_can0", ndev);
 	if (ret) {
